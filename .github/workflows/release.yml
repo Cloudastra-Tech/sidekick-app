@@ -1,0 +1,189 @@
+# One tag releases both platforms. Bump the version in client/src-tauri/tauri.conf.json and
+# Cargo.toml (in a pull request, like any change), then on main:
+#
+#   git tag -a v0.4.0 -m "What changed, in a line users will read"
+#   git push origin v0.4.0
+#
+# This builds the Windows installer and the macOS app, signs both, publishes both to the backend
+# (installed apps then offer the update), and attaches the installers to a GitHub release.
+# The tag message becomes the update notes. See CLAUDE.md "How we ship".
+#
+# "Run workflow" on the Actions tab is a dry run: it builds and signs both platforms from the
+# chosen branch and keeps the installers as run artifacts, but publishes nothing.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SIDEKICK_BACKEND_URL: ${{ vars.SIDEKICK_BACKEND_URL }}
+  SIDEKICK_RELEASE_EMAIL: ${{ secrets.SIDEKICK_RELEASE_EMAIL }}
+  SIDEKICK_RELEASE_PASSWORD: ${{ secrets.SIDEKICK_RELEASE_PASSWORD }}
+  # Cloudflare refuses GitHub's runners, so uploads go straight to the VPS (certificate still
+  # checked against the hostname).
+  SIDEKICK_BACKEND_ORIGIN_IP: ${{ vars.SIDEKICK_BACKEND_ORIGIN_IP }}
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/v') }}
+
+jobs:
+  prepare:
+    name: Check the version
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v4
+      # Fail in seconds, not after the builds, if the server can't be reached or won't log us in.
+      - name: The server is reachable and the release account signs in
+        run: |
+          host="${SIDEKICK_BACKEND_URL#*://}"
+          resolve=()
+          [ -n "$SIDEKICK_BACKEND_ORIGIN_IP" ] && resolve=(--resolve "${host%%/*}:443:$SIDEKICK_BACKEND_ORIGIN_IP")
+          curl -fsS -m 15 "${resolve[@]}" "$SIDEKICK_BACKEND_URL/health"
+          echo
+          node -e 'process.stdout.write(JSON.stringify({email:process.env.SIDEKICK_RELEASE_EMAIL,password:process.env.SIDEKICK_RELEASE_PASSWORD}))' \
+            | curl -fsS -m 15 "${resolve[@]}" -o /dev/null -X POST "$SIDEKICK_BACKEND_URL/auth/login" \
+                -H "Content-Type: application/json" --data @-
+          echo "Release account signed in"
+      - name: Tag, tauri.conf.json and Cargo.toml must agree
+        if: env.PUBLISH == 'true'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          conf="$(node -p "require('./client/src-tauri/tauri.conf.json').version")"
+          cargo="$(sed -n 's/^version = "\(.*\)"/\1/p' client/src-tauri/Cargo.toml | head -1)"
+          echo "tag $tag, tauri.conf.json $conf, Cargo.toml $cargo"
+          [ "$tag" = "$conf" ] && [ "$tag" = "$cargo" ] || {
+            echo "::error::Bump the version in tauri.conf.json and Cargo.toml to $tag first"
+            exit 1
+          }
+      - id: notes
+        name: Release notes from the tag message
+        if: env.PUBLISH == 'true'
+        run: |
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          notes="$(git for-each-ref "refs/tags/$GITHUB_REF_NAME" --format='%(contents)')"
+          {
+            echo "notes<<END_OF_NOTES"
+            echo "$notes"
+            echo "END_OF_NOTES"
+          } >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Windows
+    needs: prepare
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      SIDEKICK_RELEASE_NOTES: ${{ needs.prepare.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri
+      - name: Install
+        run: |
+          (cd client && npm ci)
+          (cd client/ui && npm ci)
+      - name: Build the signed installer
+        working-directory: client
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npx tauri build --bundles nsis
+      - name: Publish the update
+        run: |
+          installer="$(ls client/src-tauri/target/release/bundle/nsis/*-setup.exe)"
+          if [ "$PUBLISH" = "true" ]; then
+            scripts/publish-update.sh "$installer" windows-x86_64
+          else
+            echo "Dry run: built and signed $installer, not published"
+          fi
+          mkdir -p out && cp "$installer" out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/
+
+  macos:
+    name: macOS
+    needs: prepare
+    runs-on: macos-latest
+    env:
+      SIDEKICK_RELEASE_NOTES: ${{ needs.prepare.outputs.notes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri
+      - name: Install
+        run: |
+          (cd client && npm ci)
+          (cd client/ui && npm ci)
+      - name: Signing keys
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          MAC_SIGNING_P12_BASE64: ${{ secrets.MAC_SIGNING_P12_BASE64 }}
+          MAC_SIGNING_P12_PASSWORD: ${{ secrets.MAC_SIGNING_P12_PASSWORD }}
+        run: |
+          dir="$RUNNER_TEMP/sidekick-release"
+          mkdir -p "$dir"
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY" > "$dir/sidekick.key"
+          printf '%s' "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" > "$dir/password.txt"
+          printf '%s' "$MAC_SIGNING_P12_BASE64" | base64 --decode > "$dir/mac-signing.p12"
+          printf '%s' "$MAC_SIGNING_P12_PASSWORD" > "$dir/mac-signing-password.txt"
+          echo "SIDEKICK_RELEASE_DIR=$dir" >> "$GITHUB_ENV"
+      - name: Build, sign and publish
+        run: |
+          if [ "$PUBLISH" = "true" ]; then
+            scripts/release-mac.sh
+          else
+            scripts/release-mac.sh --skip-upload
+          fi
+      - name: Remove the keys
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/sidekick-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist-mac/*/Sidekick_*_universal.dmg
+
+  github-release:
+    name: GitHub release
+    needs: [prepare, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+      - name: Attach the installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ needs.prepare.outputs.notes }}
+        run: |
+          # The macOS artifact keeps its version folder; attach files, not folders.
+          mapfile -t files < <(find installers -type f \( -name '*.exe' -o -name '*.dmg' \))
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" --title "Sidekick $GITHUB_REF_NAME" --notes "$NOTES"

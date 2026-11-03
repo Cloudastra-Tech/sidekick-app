@@ -1,0 +1,13 @@
+{
+  "name": "sidekick-client",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:ui-dev": "tauri dev --config src-tauri/tauri.ui-dev.conf.json"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

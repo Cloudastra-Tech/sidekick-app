@@ -1,0 +1,86 @@
+# Runs after every merge into main: the desktop app on a real Windows machine (it can't be tested
+# on the Macs we develop on) and the backend. Feature branches and pull requests are checked
+# locally before they're opened, and macOS is tested locally too, so CI doesn't spend minutes on
+# them. Releases build both platforms in release.yml. See CLAUDE.md "How we ship".
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # No debug info in CI builds: less to write and link, smaller caches. Tests still run the same.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  client:
+    name: Desktop app (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/ui/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri
+
+      # The Rust app embeds the built UI, so it has to exist before cargo can compile.
+      - name: UI type check and build
+        working-directory: client/ui
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+
+      - name: Rust format
+        working-directory: client/src-tauri
+        run: cargo fmt --check
+
+      - name: Rust lint (warnings fail the build)
+        working-directory: client/src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rust tests
+        working-directory: client/src-tauri
+        run: cargo test
+
+  backend:
+    name: Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - name: Lint
+        run: uv run ruff check app tests
+      - name: Format
+        run: uv run ruff format --check app tests
+      - name: Tests
+        run: uv run pytest -q

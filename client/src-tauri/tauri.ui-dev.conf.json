@@ -1,0 +1,9 @@
+{
+  "build": {
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": "../ui"
+    },
+    "devUrl": "http://localhost:3118"
+  }
+}

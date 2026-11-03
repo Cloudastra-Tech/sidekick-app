@@ -1,0 +1,60 @@
+# Production stack, behind the host's nginx.
+#
+# Differences from the development compose: Postgres is only reachable by the API (no host port),
+# both services come back after a reboot, the API listens on localhost only, and published app
+# builds live on a volume so they survive a redeploy.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: sidekick
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: sidekick
+    volumes:
+      - sidekick-db:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sidekick"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://sidekick:${POSTGRES_PASSWORD}@db:5432/sidekick
+      UPDATES_DIR: /srv/data/updates
+    volumes:
+      - sidekick-updates:/srv/data/updates
+    # Only nginx talks to it; nothing from outside the machine.
+    ports:
+      - "127.0.0.1:8020:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # The host's journal, not the container's own file: a deploy replaces the container, and
+    # with it every request log from before. Read old ones with
+    # `journalctl -t sidekick-api --since "2026-10-22 10:00"`.
+    logging:
+      driver: journald
+      options: { tag: sidekick-api }
+
+volumes:
+  sidekick-db:
+  sidekick-updates:
+
+# This host runs many stacks and Docker's default pools are used up, so this one names its own
+# subnet. 10.89.7.0/24 is outside the 192.168.x ranges the others took.
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.89.7.0/24

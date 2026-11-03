@@ -1,0 +1,24 @@
+# Rust / Tauri
+target/
+**/src-tauri/target/
+**/src-tauri/gen/schemas/
+
+# Node
+node_modules/
+dist/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+# Local audio test recordings
+*.wav
+recordings/
+dist-mac/

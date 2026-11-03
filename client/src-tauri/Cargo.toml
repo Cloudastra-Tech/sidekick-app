@@ -1,0 +1,72 @@
+[package]
+name = "sidekick"
+version = "0.4.0"
+description = "Live Call Coach desktop client"
+authors = ["Cloudastra Technologies"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "sidekick_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1.53.1", features = ["sync", "time", "macros"] }
+tokio-tungstenite = { version = "0.30.0", features = ["native-tls"] }
+futures-util = "0.3.34"
+reqwest = { version = "0.13.5", features = ["json", "query", "multipart"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-updater = "2"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.24"
+# Already in the build via windows/wasapi; the COM `implement` macro needs it named directly.
+windows-core = "0.62"
+# Already a dependency of wasapi; declared directly to read process CPU time and, for call
+# detection, the registry and the process list; for echo cancellation, the Voice Capture DSP.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Registry",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Media_Audio",
+    "Win32_Media_DxMediaObjects",
+    "Win32_Graphics_Gdi",
+    "Win32_Security_Cryptography",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+libc = "0.2"
+objc2 = "0.6"
+objc2-core-audio = "0.3.2"
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-foundation = "0.3.2"
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["io-util", "net", "rt-multi-thread"] }

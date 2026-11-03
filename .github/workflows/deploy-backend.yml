@@ -1,0 +1,85 @@
+# Deploys the backend to the VPS when a change under backend/ lands on main, after its tests pass.
+# It does exactly what `git push deploy main` does by hand: the VPS hook rebuilds the containers
+# and checks /health. The job uses the "production" environment, so if a required reviewer is set
+# on it (repo Settings > Environments > production), nothing deploys until they approve.
+# "Run workflow" on the Actions tab deploys main by hand.
+name: Deploy backend
+
+on:
+  push:
+    branches: [main]
+    paths: ['backend/**']
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run ruff check app tests
+      - run: uv run pytest -q
+
+  deploy:
+    name: Deploy to the VPS
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ vars.SIDEKICK_BACKEND_URL }}/health
+    steps:
+      # The VPS repo has the full history; a shallow clone can't be pushed to it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SSH key for the VPS
+        env:
+          VPS_DEPLOY_KEY: ${{ secrets.VPS_DEPLOY_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_DEPLOY_KEY" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          # Pinned host key: never trust whatever answers at that address.
+          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - name: Push to the VPS (it rebuilds and checks /health)
+        env:
+          GIT_SSH_COMMAND: ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+          TARGET: ${{ vars.VPS_DEPLOY_TARGET }}
+        run: |
+          git push "$TARGET" "$GITHUB_SHA:refs/heads/main" 2>&1 | tee push.log
+          # The hook's exit status doesn't fail a push, so read what it reported.
+          if grep -q -- "--> deployed ${GITHUB_SHA:0:8}" push.log; then
+            echo "Deployed ${GITHUB_SHA:0:8}"
+          else
+            echo "::error::The VPS didn't report a healthy deploy of ${GITHUB_SHA:0:8}; see the log above"
+            exit 1
+          fi
+
+      # Straight to the VPS (Cloudflare refuses GitHub's runners), certificate checked as usual.
+      - name: Health check over HTTPS
+        env:
+          ORIGIN_IP: ${{ vars.SIDEKICK_BACKEND_ORIGIN_IP }}
+          BACKEND_URL: ${{ vars.SIDEKICK_BACKEND_URL }}
+        run: |
+          host="${BACKEND_URL#*://}"; host="${host%%/*}"
+          curl -fsS -m 10 --retry 3 --retry-delay 3 \
+            --resolve "$host:443:$ORIGIN_IP" "$BACKEND_URL/health"
+
+      - name: Remove the key
+        if: always()
+        run: rm -f ~/.ssh/deploy
